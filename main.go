@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sync"
+	"net/http"
+	"strconv"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5"
 )
 
 const (
@@ -18,11 +19,20 @@ const (
 )
 
 type Data struct {
-	ID   int
-	Name string
+	ID      int
+	Name    string
+	Product int
 }
 
-func ensureTableExists(ctx context.Context, pool *pgxpool.Pool) error {
+func findByID(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		log.Fatalf("Error to get id: %v\n", err)
+	}
+	w.Write([]byte(dataBase(id)))
+}
+
+func ensureTableExists(ctx context.Context, conn *pgx.Conn) error {
 	createTableQuery := `
 		CREATE TABLE IF NOT EXISTS yourtable (
 			id SERIAL PRIMARY KEY,
@@ -31,7 +41,7 @@ func ensureTableExists(ctx context.Context, pool *pgxpool.Pool) error {
 		);
 	`
 
-	_, err := pool.Exec(ctx, createTableQuery)
+	_, err := conn.Exec(ctx, createTableQuery)
 	if err != nil {
 		log.Fatalf("Failed to create table: %v\n", err)
 	}
@@ -40,66 +50,60 @@ func ensureTableExists(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
-func fetchData(ctx context.Context, pool *pgxpool.Pool, query string, wg *sync.WaitGroup, ch chan<- Data) {
-	defer wg.Done()
+func fetchData(ctx context.Context, conn *pgx.Conn, query string, id int) Data {
+	var data Data
 
-	rows, err := pool.Query(ctx, query)
-	if err != nil {
-		log.Fatalf("Failed to execute query: %v\n", err)
-	}
-	defer rows.Close()
+	rows := conn.QueryRow(ctx, query, id)
 
-	for rows.Next() {
-		var data Data
-		if err := rows.Scan(&data.ID, &data.Name); err != nil {
-			log.Fatalf("Failed to scan row: %v\n", err)
-		}
-		ch <- data
+	if err := rows.Scan(&data.ID, &data.Name, &data.Product); err != nil {
+		log.Fatalf("Failed to scan row: %v\n", err)
 	}
-	if err := rows.Err(); err != nil {
-		log.Fatalf("Error iterating rows: %v\n", err)
-	}
+
+	return data
 }
 
-func main() {
+func dataBase(id int) string {
+
 	connString := fmt.Sprintf("postgres://%s:%s@%s:%d/%s", user, password, host, port, dbname)
 
-	pool, err := pgxpool.New(context.Background(), connString)
+	conn, err := pgx.Connect(context.Background(), connString)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v\n", err)
 	}
-	defer pool.Close()
+	defer conn.Close(context.Background())
 
-	if err := pool.Ping(context.Background()); err != nil {
+	if err := conn.Ping(context.Background()); err != nil {
 		log.Fatalf("Failed to ping to database: %v\n", err)
 	}
 
-	if err := ensureTableExists(context.Background(), pool); err != nil {
-		log.Fatalf("Failed to create connection pool: %v\n", err)
+	if err := ensureTableExists(context.Background(), conn); err != nil {
+		log.Fatalf("Failed to create connection: %v\n", err)
 	}
 
-	ch := make(chan Data)
-	var wg sync.WaitGroup
+	query := "SELECT id, name, product FROM yourtable WHERE product = $1"
 
-	queries := []string{
-		"SELECT id, name FROM yourtable WHERE product = 1",
-		"SELECT id, name FROM yourtable WHERE product = 2",
-		"SELECT id, name FROM yourtable WHERE product = 3",
-	}
+	data := fetchData(context.Background(), conn, query, id)
+	fmt.Printf("Received data: ID=%d, Name=%s, Product=%d\n", data.ID, data.Name, data.Product)
 
-	for _, query := range queries {
-		wg.Add(1)
-		go fetchData(context.Background(), pool, query, &wg, ch)
-	}
-
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
-
-	for data := range ch {
-		fmt.Printf("Received data: ID=%d, Name=%s\n", data.ID, data.Name)
-	}
+	res := fmt.Sprintf("Received data: ID=%d, Name=%s, Product=%d\n", data.ID, data.Name, data.Product)
 
 	fmt.Println("All data fetched.")
+
+	return res
+}
+
+func main() {
+	router := http.NewServeMux()
+
+	router.HandleFunc("GET /{id}", findByID)
+
+	server := http.Server{
+		Addr:    ":8080",
+		Handler: router,
+	}
+
+	log.Println("Starting server on port :8080")
+
+	server.ListenAndServe()
+
 }
